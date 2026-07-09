@@ -25,8 +25,28 @@ DUCKTERM_FLAVOR=full              # force bundled-node package
 DUCKTERM_NO_SERVICE=1             # install only, don't register a service
 ```
 
+After install, `~/.duckterm/config.json` holds runtime settings while the
+launchd/systemd unit stays stable.
+
+Persistent LAN/HTTPS:
+```sh
+~/.duckterm/app/duckterm.mjs config --lan --reload
+~/.duckterm/app/duckterm.mjs status
+```
+
 ## Homebrew (macOS / Linux)
 ```sh
 brew install ducksee/tap/duckterm-web
 brew services start duckterm-web
+```
+
+Homebrew prints the first-login URL to `$(brew --prefix)/var/log/duckterm-web.log`.
+
+Homebrew service management:
+```sh
+duckterm-web status
+duckterm-web config --lan --reload
+duckterm-web config --local --reload
+duckterm-web config --port 1443 --reload
+duckterm-web reload
 ```

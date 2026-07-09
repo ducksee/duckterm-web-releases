@@ -33,6 +33,21 @@ say()  { printf '\033[1;36m[duckterm]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[duckterm]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[duckterm]\033[0m %s\n' "$*" >&2; exit 1; }
 
+lan_ip() {
+  if command -v ip >/dev/null 2>&1; then
+    ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
+    return 0
+  fi
+  if command -v ipconfig >/dev/null 2>&1; then
+    for iface in en0 en1; do
+      ipconfig getifaddr "$iface" 2>/dev/null && return 0
+    done
+  fi
+  if command -v hostname >/dev/null 2>&1; then
+    hostname -I 2>/dev/null | awk '{print $1}'
+  fi
+}
+
 # ---- detect os/arch ----------------------------------------------------
 uname_s=$(uname -s)
 uname_m=$(uname -m)
@@ -140,6 +155,7 @@ const { installService } = await import(`${appDir}/service-manager.mjs`);
 const r = installService({
   nodePath,
   bridgeEntry: `${appDir}/dev-bridge.mjs`,
+  launcherEntry: `${appDir}/duckterm.mjs`,
   distPath: `${appDir}/dist`,
   workdir: appDir,
   port: Number(port),
@@ -154,8 +170,11 @@ sleep 3
 TOKEN=$(cat "$HOME/.duckterm/dev-bridge-token" 2>/dev/null || echo "")
 say "─── DuckTerm Web is running ───"
 if [ "${DUCKTERM_EXPOSE:-}" = "1" ]; then
-  ip=$( (command -v hostname >/dev/null && hostname -I 2>/dev/null | awk '{print $1}') || echo "<lan-ip>" )
-  say "  $SCHEME://$ip:$PORT/#token=$TOKEN"
+  ip=$(lan_ip)
+  say "  $SCHEME://${ip:-<lan-ip>}:$PORT/#token=$TOKEN"
 fi
 say "  $SCHEME://localhost:$PORT/#token=$TOKEN"
 say "first visit → set up an admin account → then log in with a password."
+say "Status: $APP_DIR/duckterm.mjs status"
+say "Reload: $APP_DIR/duckterm.mjs reload"
+say "Enable LAN/HTTPS later: $APP_DIR/duckterm.mjs config --lan --reload"
