@@ -151,8 +151,8 @@ if [ "${DUCKTERM_EXPOSE:-}" = "1" ]; then DUCKTERM_HOST="0.0.0.0"; SCHEME="https
 
 "$NODE" --input-type=module - "$APP_DIR" "$NODE" "$PORT" "$DUCKTERM_HOST" <<'NODEJS'
 const [appDir, nodePath, port, host] = process.argv.slice(2);
-const { installService } = await import(`${appDir}/service-manager.mjs`);
-const r = installService({
+const sm = await import(`${appDir}/service-manager.mjs`);
+const r = sm.installService({
   nodePath,
   bridgeEntry: `${appDir}/dev-bridge.mjs`,
   launcherEntry: `${appDir}/duckterm.mjs`,
@@ -161,8 +161,18 @@ const r = installService({
   port: Number(port),
   host,
 });
-console.log("[duckterm] service:", r.ok ? "installed" : "FAILED", r.error || "");
-if (!r.ok) process.exit(1);
+if (!r.ok) { console.log("[duckterm] service: FAILED", r.error || ""); process.exit(1); }
+if (r.reloadNeeded) {
+  // The service was already installed → this run is an UPGRADE (the app dir was
+  // just overwritten). A FULL restart replaces the running launcher + bridge; a
+  // SIGHUP reload would only respawn the bridge under the OLD launcher, and a
+  // stale bridge would keep serving the old version.
+  const rr = sm.restartService();
+  console.log("[duckterm] service:", rr.ok ? "restarted (upgraded)" : `restart FAILED: ${rr.error || ""}`);
+  if (!rr.ok) process.exit(1);
+} else {
+  console.log("[duckterm] service: installed");
+}
 NODEJS
 
 sleep 3
