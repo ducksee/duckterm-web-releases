@@ -55,15 +55,23 @@ Everyday commands:
 duckterm-web url                        # login URL + bootstrap token
 duckterm-web status                     # service state, version, update check
 duckterm-web version                    # installed version
+duckterm-web upgrade                    # update to the latest release
 duckterm-web config --lan --reload      # persistent LAN + HTTPS
 duckterm-web config --local --reload    # back to localhost + HTTP
 duckterm-web config --port 1443 --reload
 duckterm-web reload
 ```
 
-Upgrade (Homebrew won't restart a running service for you):
+Upgrade — one command (Homebrew doesn't reliably auto-pull third-party taps, so
+plain `brew upgrade` can miss updates; this does a targeted tap refresh, then
+upgrades and restarts the service):
 ```sh
-brew upgrade duckterm-web && brew services restart duckterm-web
+duckterm-web upgrade
+```
+
+Prefer the manual steps? Targeted refresh (not a full `brew update`):
+```sh
+git -C "$(brew --repo ducksee/tap)" pull --ff-only && brew upgrade duckterm-web && brew services restart duckterm-web
 ```
 
 Uninstall:
