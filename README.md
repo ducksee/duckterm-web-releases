@@ -15,7 +15,7 @@ Picks the smallest package that runs on your machine:
 - **full-<os>-<arch>** (~50MB, bundles Node) otherwise
 
 Then installs a persistent service (systemd / launchd), starts it, and
-prints the URL + one-time token.
+prints the URL + bootstrap token.
 
 ### Options
 ```sh
@@ -35,18 +35,38 @@ Persistent LAN/HTTPS:
 ```
 
 ## Homebrew (macOS / Linux)
+
+`ducksee/tap` is a third-party tap maintained by the DuckTerm authors, not
+Homebrew. Install the fully-qualified formula — Homebrew adds the tap
+automatically and trusts only this formula:
+
 ```sh
 brew install ducksee/tap/duckterm-web
 brew services start duckterm-web
 ```
 
-Homebrew prints the first-login URL to `$(brew --prefix)/var/log/duckterm-web.log`.
-
-Homebrew service management:
+Get the login URL (with the first-login bootstrap token):
 ```sh
-duckterm-web status
-duckterm-web config --lan --reload
-duckterm-web config --local --reload
+duckterm-web url
+```
+
+Everyday commands:
+```sh
+duckterm-web url                        # login URL + bootstrap token
+duckterm-web status                     # service state, version, update check
+duckterm-web version                    # installed version
+duckterm-web config --lan --reload      # persistent LAN + HTTPS
+duckterm-web config --local --reload    # back to localhost + HTTP
 duckterm-web config --port 1443 --reload
 duckterm-web reload
+```
+
+Upgrade (Homebrew won't restart a running service for you):
+```sh
+brew upgrade duckterm-web && brew services restart duckterm-web
+```
+
+Uninstall:
+```sh
+brew services stop duckterm-web && brew uninstall duckterm-web
 ```
