@@ -54,6 +54,18 @@ node_supported() {
   }
 }
 
+shell_quote() {
+  # POSIX single-quote serialization for the generated launcher/profile.
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+path_contains_dir() {
+  case ":${PATH:-}:" in
+    *:"$1":*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 find_node() {
   for cand in \
     "$(command -v node 2>/dev/null || true)" \
@@ -165,6 +177,43 @@ if [ -n "$VER" ] && [ "$package_version" != "$VER" ]; then die "package version 
 "$STAGE_NODE" "$stage/duckterm.mjs" version | grep -F "duckterm-web $package_version" >/dev/null \
   || die "staged launcher failed its version check"
 
+# The service always uses absolute paths. Separately expose one stable CLI
+# entry so a fresh interactive shell can run `duckterm-web` without knowing
+# the versioned app directory or bundled Node location.
+if [ -n "${DUCKTERM_CLI_BIN_DIR:-}" ]; then
+  cli_bin_dir=$DUCKTERM_CLI_BIN_DIR
+elif [ "$(id -u)" -eq 0 ]; then
+  cli_bin_dir=/usr/local/bin
+else
+  cli_bin_dir="$HOME/.local/bin"
+fi
+case "$cli_bin_dir" in
+  /*) ;;
+  *) die "DUCKTERM_CLI_BIN_DIR must be absolute: $cli_bin_dir" ;;
+esac
+cli_path="$cli_bin_dir/duckterm-web"
+cli_marker="# DuckTerm Web CLI wrapper"
+cli_was_present=0
+if [ -e "$cli_path" ] || [ -L "$cli_path" ]; then
+  grep -Fq "$cli_marker" "$cli_path" 2>/dev/null ||
+    die "refusing to replace an unmanaged CLI entry: $cli_path"
+  cli_was_present=1
+fi
+
+cli_profile_path=""
+cli_profile_kind=posix
+cli_profile_was_present=0
+if ! path_contains_dir "$cli_bin_dir"; then
+  case "${SHELL##*/}" in
+    zsh) cli_profile_path="$HOME/.zprofile" ;;
+    fish)
+      cli_profile_path="$HOME/.config/fish/conf.d/duckterm-web-path.fish"
+      cli_profile_kind=fish
+      ;;
+    *) cli_profile_path="$HOME/.profile" ;;
+  esac
+fi
+
 # Service registration and runtime config are part of the same transaction as
 # the application directory. A previous installer restored only APP_DIR; if a
 # new systemd unit was invalid, rollback left the old bytes behind an unusable
@@ -188,9 +237,43 @@ if [ -f "$config_path" ]; then
   cp -p "$config_path" "$service_state/config.json"
   config_was_present=1
 fi
+if [ "$cli_was_present" -eq 1 ]; then
+  cp -pP "$cli_path" "$service_state/duckterm-web.cli"
+fi
+if [ -n "$cli_profile_path" ] && [ -f "$cli_profile_path" ]; then
+  cp -p "$cli_profile_path" "$service_state/cli-profile"
+  cli_profile_was_present=1
+fi
 
 systemctl_web() {
   if [ "$(id -u)" -eq 0 ]; then systemctl "$@"; else systemctl --user "$@"; fi
+}
+
+# PIDs of foreground DuckTerm Web processes owned by this app dir. Argv alone
+# is not a reliable key: an instance launched with `cd app && node duckterm.mjs`
+# shows a relative script path in ps. /proc/<pid>/cwd is authoritative on the
+# no-init Linux hosts where the foreground service kind applies.
+fg_owner_pids() {
+  for _pid in $(pgrep -f 'duckterm\.mjs|dev-bridge\.mjs' 2>/dev/null); do
+    # Only ever target the launcher/bridge themselves — both are node. A
+    # viewer or editor that merely mentions the script in argv while sitting
+    # in the app dir (vim duckterm.mjs, less, tail -f, grep ...) must never
+    # enter the kill set.
+    case "$(readlink "/proc/$_pid/exe" 2>/dev/null)" in
+      */node|*/nodejs) ;;
+      *) continue ;;
+    esac
+    # cwd catches relative-argv instances; it may point at the previous
+    # install's rollback dir (readlink appends " (deleted)" once that dir is
+    # gone), so match the backup path as a prefix too.
+    case "$(readlink "/proc/$_pid/cwd" 2>/dev/null)" in
+      "$APP_DIR"|"$APP_DIR"/*|"$backup"*) printf '%s\n' "$_pid"; continue ;;
+    esac
+    # cmdline catches absolute-argv instances launched from any cwd.
+    case "$(tr '\0' ' ' <"/proc/$_pid/cmdline" 2>/dev/null)" in
+      *"$APP_DIR/"*) printf '%s\n' "$_pid" ;;
+    esac
+  done
 }
 
 if [ "$OS" = darwin ]; then
@@ -228,6 +311,18 @@ elif grep -Eqi 'microsoft|wsl' /proc/sys/kernel/osrelease /proc/version 2>/dev/n
       fi
     fi
   fi
+elif [ "$(cat /proc/1/comm 2>/dev/null || true)" != systemd ] ||
+  ! command -v systemctl >/dev/null 2>&1; then
+  # Container / no-init Linux (PID 1 = tini, sh, ...). While systemd is
+  # offline, `systemctl enable` still succeeds (it only writes symlinks) but
+  # nothing can ever start the unit; the install would then time out its
+  # health check and roll back with no explanation. Treat foreground as the
+  # first-class service kind: the container's own supervisor is the boot
+  # persistence layer, and the install validates the package by running a
+  # temporary real instance instead of pretending a service manager exists.
+  service_kind=foreground
+  service_path="$APP_DIR/run.sh"
+  [ -n "$(fg_owner_pids)" ] && service_was_running=1 || true
 else
   service_kind=systemd
   if [ "$(id -u)" -eq 0 ]; then
@@ -252,6 +347,56 @@ restart_previous_service() {
   esac
 }
 
+restore_cli_exposure() {
+  rm -f "$cli_path"
+  if [ "$cli_was_present" -eq 1 ]; then
+    mkdir -p "$cli_bin_dir"
+    cp -pP "$service_state/duckterm-web.cli" "$cli_path"
+  fi
+  if [ -n "$cli_profile_path" ]; then
+    if [ "$cli_profile_was_present" -eq 1 ]; then
+      mkdir -p "$(dirname "$cli_profile_path")"
+      cp -p "$service_state/cli-profile" "$cli_profile_path"
+    else
+      rm -f "$cli_profile_path"
+    fi
+  fi
+}
+
+install_cli_exposure() {
+  mkdir -p "$cli_bin_dir"
+  cli_tmp=$(mktemp "${cli_path}.tmp.XXXXXX") || return 1
+  {
+    printf '#!/bin/sh\n%s\n' "$cli_marker"
+    printf 'exec %s %s "$@"\n' "$(shell_quote "$NODE")" "$(shell_quote "$APP_DIR/duckterm.mjs")"
+  } >"$cli_tmp" || { rm -f "$cli_tmp"; return 1; }
+  chmod 0755 "$cli_tmp" || { rm -f "$cli_tmp"; return 1; }
+  mv "$cli_tmp" "$cli_path" || { rm -f "$cli_tmp"; return 1; }
+
+  [ -n "$cli_profile_path" ] || return 0
+  mkdir -p "$(dirname "$cli_profile_path")" || return 1
+  profile_tmp=$(mktemp "${cli_profile_path}.tmp.XXXXXX") || return 1
+  if [ -f "$cli_profile_path" ]; then
+    awk '
+      $0 == "# >>> DuckTerm Web CLI >>>" { skipping=1; next }
+      $0 == "# <<< DuckTerm Web CLI <<<" { skipping=0; next }
+      !skipping { print }
+    ' "$cli_profile_path" >"$profile_tmp" || { rm -f "$profile_tmp"; return 1; }
+  fi
+  {
+    printf '\n# >>> DuckTerm Web CLI >>>\n'
+    if [ "$cli_profile_kind" = fish ]; then
+      printf 'fish_add_path --global --move %s\n' "$(shell_quote "$cli_bin_dir")"
+    else
+      quoted_cli_bin=$(shell_quote "$cli_bin_dir")
+      printf 'case ":$PATH:" in *:%s:*) ;; *) PATH=%s:$PATH; export PATH ;; esac\n' \
+        "$quoted_cli_bin" "$quoted_cli_bin"
+    fi
+    printf '# <<< DuckTerm Web CLI <<<\n'
+  } >>"$profile_tmp" || { rm -f "$profile_tmp"; return 1; }
+  mv "$profile_tmp" "$cli_profile_path" || { rm -f "$profile_tmp"; return 1; }
+}
+
 # Stop the exact existing owner before replacing application bytes. Ordinary
 # Unix filesystems allow renaming a directory whose scripts are still mapped,
 # but WSL1's wslfs can reject it with EPERM. More importantly, stopping first
@@ -270,6 +415,20 @@ if [ "$service_was_running" -eq 1 ]; then
     sysv)
       "$service_path" stop >/dev/null 2>&1 ||
         die "could not stop the previous SysV owner"
+      ;;
+    foreground)
+      # Kill the cwd-derived pid set: the launcher (duckterm.mjs) spawns
+      # dev-bridge.mjs as the child that owns the listening socket, and either
+      # may appear in ps with a relative script path. Leaving the bridge alive
+      # would keep the port held and turn the health check into a false green.
+      fg_pids=$(fg_owner_pids)
+      [ -n "$fg_pids" ] || die "could not stop the previous foreground owner"
+      kill $fg_pids 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        [ -z "$(fg_owner_pids)" ] && break
+        sleep 1
+      done
+      [ -z "$(fg_owner_pids)" ] || die "could not stop the previous foreground owner"
       ;;
   esac
   service_stopped=1
@@ -303,11 +462,19 @@ rollback() {
       rm -f "$service_path"
       [ -z "$wsl_launcher" ] || rm -f "$wsl_launcher"
       ;;
+    foreground)
+      # Stop whatever health-check instance is still attached to the app dir;
+      # $!-derived pgids are unreliable here (setsid may have forked).
+      rollback_fg_pids=$(fg_owner_pids)
+      [ -z "$rollback_fg_pids" ] || kill $rollback_fg_pids 2>/dev/null || true
+      ;;
   esac
   rm -rf "$APP_DIR"
   if [ -d "$backup" ]; then
     mv "$backup" "$APP_DIR"
   fi
+
+  restore_cli_exposure
 
   mkdir -p "$(dirname "$config_path")"
   if [ "$config_was_present" -eq 1 ]; then
@@ -355,6 +522,13 @@ rollback() {
         cp -p "$service_state/DuckTerm-Web.cmd" "$wsl_launcher"
       fi
       ;;
+    foreground)
+      if [ "$service_was_running" -eq 1 ]; then
+        # The restored app dir is the previous version, which may predate
+        # run.sh — do not point at a file that might not exist.
+        warn "ROLLBACK INCOMPLETE: restart your previous foreground instance with your supervisor"
+      fi
+      ;;
   esac
 
   if [ "$homebrew_was_running" -eq 1 ] && [ -n "$homebrew_bin" ]; then
@@ -381,10 +555,78 @@ if [ "$OS" = darwin ] && [ "${DUCKTERM_MIGRATE_HOMEBREW:-}" = 1 ]; then
   fi
 fi
 
+install_cli_exposure || rollback
+
 if [ "${DUCKTERM_NO_SERVICE:-}" = 1 ]; then
   rm -rf "$backup"
   say "installed v$package_version to $APP_DIR (service registration skipped)"
+  say "CLI: $cli_path"
+  [ -z "$cli_profile_path" ] || say "PATH registration: $cli_profile_path (open a new shell)"
   say "run: $NODE $APP_DIR/duckterm.mjs foreground --lan"
+  exit 0
+fi
+
+if [ "$service_kind" = foreground ]; then
+  run_sh="$APP_DIR/run.sh"
+  {
+    printf '#!/bin/sh\n'
+    printf '# DuckTerm Web entry for hosts without an init supervisor (containers).\n'
+    printf '# Wire this into the container supervisor for boot persistence, e.g.\n'
+    printf '#   docker CMD / compose command: ["%s"]\n' "$run_sh"
+    printf '#   ad hoc: setsid nohup %s >/var/log/duckterm-web.log 2>&1 &\n' "$run_sh"
+    printf 'cd %s || exit 1\n' "$(shell_quote "$APP_DIR")"
+    printf 'exec %s %s foreground --lan\n' "$(shell_quote "$NODE")" "$(shell_quote "$APP_DIR/duckterm.mjs")"
+  } >"$run_sh"
+  chmod 0755 "$run_sh"
+  # Health-check the real application: launch a temporary foreground instance,
+  # probe it, stop it. This proves the package runs on this machine without
+  # pretending an init system exists.
+  config_port="${DUCKTERM_PORT:-1420}"
+  # The health check is only honest if it can see OUR instance. A lingering
+  # listener (an unstopped previous owner, or an unrelated process) would
+  # answer the probe and green-light an install that never ran.
+  if curl -kfsS --max-time 2 "https://127.0.0.1:$config_port/" >/dev/null 2>&1 ||
+    curl -fsS --max-time 2 "http://127.0.0.1:$config_port/" >/dev/null 2>&1; then
+    warn "port $config_port is already served by another process; cannot health-check the new install"
+    rollback
+  fi
+  fg_log="$HOME/.duckterm/web-install-health.log"
+  setsid "$run_sh" >>"$fg_log" 2>&1 &
+  healthy=0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if curl -kfsS --max-time 2 "https://127.0.0.1:$config_port/" >/dev/null 2>&1 ||
+      curl -fsS --max-time 2 "http://127.0.0.1:$config_port/" >/dev/null 2>&1; then
+      healthy=1
+      break
+    fi
+    sleep 1
+  done
+  # Tear the temporary instance down to zero before declaring success: a
+  # lingering listener would race (and mask) the real supervisor's instance.
+  # Do not signal the recorded $! process group: setsid forks when the
+  # background child already leads a group, so that pgid can be dead while
+  # the instance lives on under a subreaper. The cwd-derived pid set is the
+  # authoritative handle.
+  fg_pids=$(fg_owner_pids)
+  [ -z "$fg_pids" ] || kill $fg_pids 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    [ -z "$(fg_owner_pids)" ] && break
+    sleep 1
+  done
+  fg_pids=$(fg_owner_pids)
+  if [ -n "$fg_pids" ]; then
+    kill -KILL $fg_pids 2>/dev/null || true
+    sleep 1
+  fi
+  [ -z "$(fg_owner_pids)" ] || warn "temporary health-check instance did not exit; stop it before starting the supervisor"
+  [ "$healthy" -eq 1 ] || rollback
+  rm -rf "$backup"
+  say "installed DuckTerm Web v$package_version (validated with a temporary foreground instance; log: $fg_log)"
+  say "CLI: $cli_path"
+  [ -z "$cli_profile_path" ] || say "PATH registration: $cli_profile_path (open a new shell)"
+  say "PID 1 is $(cat /proc/1/comm 2>/dev/null || echo unknown), not systemd: boot persistence is delegated to your container supervisor"
+  say "start now: setsid nohup $run_sh >/var/log/duckterm-web.log 2>&1 &"
+  say "persist:   point the container supervisor (docker CMD / compose / s6) at $run_sh"
   exit 0
 fi
 
@@ -428,5 +670,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 done
 [ "$healthy" -eq 1 ] || rollback
 rm -rf "$backup"
+say "CLI: $cli_path"
+[ -z "$cli_profile_path" ] || say "PATH registration: $cli_profile_path (open a new shell)"
 say "installed DuckTerm Web v$package_version; service is healthy and auto-start is enabled"
 "$NODE" "$APP_DIR/duckterm.mjs" status
